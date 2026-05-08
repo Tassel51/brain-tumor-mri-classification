@@ -12,7 +12,7 @@
 | 垂体瘤 | pituitary | 发生在垂体腺的肿瘤 |
 | 正常 | notumor | 无肿瘤发现的脑部MRI |
 
-<img width="1000" height="294" alt="image" src="https://github.com/user-attachments/assets/4e80c4a1-af19-4fd7-b226-b16a7bf53a5d" />
+<img width="1000" height="750" alt="image" src="https://github.com/user-attachments/assets/4e80c4a1-af19-4fd7-b226-b16a7bf53a5d" />
 
 ## 项目结构
 
