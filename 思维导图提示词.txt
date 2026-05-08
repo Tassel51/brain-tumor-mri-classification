@@ -1,0 +1,154 @@
+请帮我画一张"脑肿瘤MRI辅助诊断系统"的详细思维导图/流程图，要结构清晰、层次分明、内容详实。请同时包含项目整体流程图和模块结构图两个视角。
+
+以下是完整内容：
+
+==================== 视角一：项目整体流程图 ====================
+
+标题：脑肿瘤MRI辅助诊断系统 — 整体流程图
+
+整个流程从左到右依次展开，分为五个大阶段：
+
+阶段1：数据集准备（data/download.py）
+- 检查本地缓存（data/raw/organized/）
+  → 已存在 → 跳过下载，直接进入阶段2
+  → 不存在 → 进入三级回退下载策略
+    - 策略1：Kaggle API下载（kagglehub库）
+      → 成功 → extract_and_organize_from_kaggle（类别名映射：glioma_tumor→glioma 等 + Training→train / Testing→test）
+      → 失败 → 进入策略2
+    - 策略2：GitHub镜像HTTP流式下载（requests + tqdm进度条）
+      → 成功 → extract_and_organize（zip解压 + os.walk递归查找 + 目录重组为ImageFolder格式）
+      → 失败 → 进入策略3
+    - 策略3：NumPy合成数据生成（generate_synthetic_data）
+      → 高斯噪声基底 → 椭圆形脑部轮廓模拟 → 按类别叠加不同肿瘤特征区域（胶质瘤宽亮斑 / 脑膜瘤集中亮斑 / 垂体瘤微小亮斑 / 正常无异常） → 三通道JPEG输出
+- 最终输出：organized/train/{glioma,meningioma,pituitary,notumor}/ 和 organized/test/{同上} 的标准ImageFolder目录结构
+
+阶段2：数据加载与预处理（data/dataset.py + data/preprocessing.py）
+- 训练集数据变换流水线（get_train_transforms）：
+  Resize(224×224) → RandomRotation(±20°) → RandomHorizontalFlip → ColorJitter(brightness=0.2, contrast=0.2) → RandomAffine(translate=0.1) → ToTensor → Normalize(ImageNet均值/标准差) → RandomErasing(p=0.25)
+- 验证集/测试集数据变换流水线（get_val_transforms）：
+  Resize(224×224) → ToTensor → Normalize(ImageNet均值/标准差)
+- BrainTumorDataset类：遍历类别子文件夹 → 收集图像路径 → PIL验证每张图像完整性（损坏自动剔除） → __getitem__ 以RGB模式打开并应用变换
+- 分层采样划分（split_dataset）：sklearn train_test_split × 2次 → 训练集70% / 验证集15% / 测试集15%，按类别标签分层保证分布一致
+- DataLoader封装：训练集 shuffle=True + drop_last=True + pin_memory=True；验证/测试集 shuffle=False + pin_memory=True
+- 推理专用预处理（preprocess_for_inference）：CLAHE对比度增强（LAB色彩空间L通道，clipLimit=3.0, tileGridSize=8×8） → 保持宽高比缩放(长边→224) → 中心裁剪(224×224)
+
+阶段3：模型构建（models/transfer.py + models/cnn.py）
+- 模型选择（config.py MODEL_NAME参数控制，共9种可选）：
+  ├── 迁移学习模型（TransferLearningModel）：resnet50(默认) / resnet101 / resnet152 / densenet121 / densenet169 / efficientnet_b0 / efficientnet_b1 / convnext_tiny
+  │    构建流程：加载ImageNet预训练权重(torchvision.models) → 可选冻结骨干网络(freeze_backbone) → 替换分类头
+  │    分类头结构：Dropout(0.5) → Linear(in_features, 4)
+  │    Forward路径：ResNet系列按 conv1→bn1→relu→maxpool→layer1→layer2→layer3→layer4→avgpool→flatten→classifier 逐层传播
+  │    辅助方法：get_feature_vector(提取2048维特征) / unfreeze_backbone(解冻微调) / get_trainable_params(参数统计)
+  └── 自定义CNN（CustomCNN）：从零训练
+       结构：Initial(7×7conv stride2 + maxpool) → Stage1(Inception多尺度：1×1分支+3×3分支+5×5分支+maxpool分支 并行) → Stage2(3×3conv stride2降采样 + SE注意力模块[GAP→FC降维→ReLU→FC升维→Sigmoid→通道加权]) → Stage3(Inception + SE注意力) → GAP全局平均池化 → Classifier(Dropout0.5→Linear512→256→ReLU→BatchNorm1d→Dropout0.4→Linear256→4)
+       权重初始化：Conv2d用kaiming_normal / BatchNorm用常数 / Linear用N(0,0.01)
+
+阶段4：训练与验证（train.py）
+- 训练配置（config.py）：
+  ├── 损失函数：CrossEntropyLoss
+  ├── 优化器：AdamW（lr=1e-4, weight_decay=1e-5）
+  ├── 学习率调度：ReduceLROnPlateau（mode=max, factor=0.5, patience=5, min_lr=1e-7）
+  ├── 早停机制：EarlyStopping（patience=15, min_delta=1e-4, mode=max）
+  ├── 梯度裁剪：max_norm=10.0
+  └── 最大训练轮数：50 epochs
+- 训练循环（每个epoch）：
+  ① train_one_epoch：model.train() → 遍历train_loader → inputs/labels移至GPU → forward得logits → 计算loss → backward → 梯度裁剪 → optimizer.step() → Evaluator累积统计 → ProgressBar实时显示（30字符ASCII进度条+损失+准确率+耗时）
+  ② validate（@torch.no_grad）：model.eval() → 遍历val_loader → 计算val_loss和val_acc → Evaluator汇总
+  ③ scheduler.step(val_acc) → 学习率衰减判定
+  ④ 记录历史（7条曲线）：train_loss / train_acc / val_loss / val_acc / test_loss / test_acc / lr
+  ⑤ 保存最佳模型：val_acc创新高 → torch.save(checkpoint) → checkpoints/best_model_xxx.pth（含model_state_dict + optimizer_state_dict + epoch + best_val_acc + config）
+  ⑥ 早停检查：连续15 epoch无提升 → break → 恢复最佳模型参数
+- 日志系统（Logger）：Python logging双通道（控制台+文件） + TensorBoard SummaryWriter（Loss/train, Loss/val, Accuracy/train, Accuracy/val, LR, Train/F1等标量）
+- 训练结束后：绘制训练历史曲线图（1行3列：损失曲线+准确率曲线+学习率曲线）→ 保存JSON格式训练历史
+
+阶段5：评估与推理
+- 评估子流程（evaluate.py）：
+  model.eval() + torch.no_grad() → 遍历test_loader(394张) → Evaluator累积全部预测 → compute_metrics一次性计算11项指标
+  输出指标：Accuracy / Precision(Macro+Weighted) / Recall(Macro+Weighted) / F1(Macro+Weighted) / 各类别F1 / AUC-ROC(OvR) / ConfusionMatrix / ClassificationReport
+  生成5张可视化图表：
+    ① 混淆矩阵热力图（整数计数版 + 行归一化比例版，蓝色colormap + 单元格数值标注 + 中文类别标签）
+    ② ROC曲线图（一对多策略，sklearn label_binarize + roc_curve + auc，4色曲线 + AUC标注 + 随机基线虚线）
+    ③ 各类别指标分组柱状图（每类3根柱子：F1/Precision/Recall，不同颜色）
+    ④ 随机样本预测网格图（16张，绿色标题=正确/红色标题=错误，显示真实类别+预测类别+置信度）
+    ⑤ 训练历史曲线图（已在阶段4生成）
+  所有图表保存至results/目录，DPI=150
+
+- 推理子流程（inference.py）：
+  ├── load_model_for_inference：构建模型框架 → torch.load检查点 → load_state_dict恢复权重
+  ├── predict_single（单图）：preprocess_single_image(CLAHE+保持宽高比缩放+中心裁剪+标准化) → 模型forward → Softmax → topk(2)提取 → print_prediction_result（Unicode方块柱状图显示4类概率分布 + 置信度百分比）
+  └── predict_batch（批量）：glob扫描目录(*.jpg/*.jpeg/*.png/*.bmp) → 逐张调用predict_single → 汇总结果列表 → 打印每张图像的文件名/预测类别/置信度
+
+==================== 视角二：项目目录结构与模块依赖关系图 ====================
+
+标题：脑肿瘤MRI辅助诊断系统 — 项目架构
+
+用一棵倒置的树状图展示项目目录结构，每个文件和目录标注其核心职责：
+
+脑肿瘤MRI辅助诊断系统/
+│
+├── main.py ← 【主入口/调度中枢】
+│     argparse解析5种运行模式(auto/train/evaluate/predict/batch_predict)
+│     统一调度：set_seed→print_system_info→下载数据→加载数据→构建模型→训练→评估
+│     命令行参数可覆盖config.py中的MODEL_NAME/EPOCHS/BATCH_SIZE/SEED
+│
+├── config.py ← 【全局配置中心】
+│     路径配置(5个目录自动创建) / 数据集元数据(4类别中英文名) / 训练超参数(BATCH_SIZE=32, EPOCHS=50, LR=1e-4, WEIGHT_DECAY=1e-5) / 数据增强参数(7项) / 模型选择(MODEL_NAME) / 日志可视化设置
+│
+├── data/
+│   ├── download.py ← 【数据集获取三级回退】
+│   │     download_with_kagglehub / download_with_requests / generate_synthetic_data
+│   │     extract_and_organize / extract_and_organize_from_kaggle
+│   │     prepare_dataset主入口
+│   ├── dataset.py ← 【数据集加载与增强】
+│   │     BrainTumorDataset(PIL验证完整性) / get_train_transforms(7步增强) / get_val_transforms(3步基础) / split_dataset(分层采样) / create_dataloaders(DataLoader封装) / get_class_weights(反频率加权)
+│   ├── preprocessing.py ← 【推理预处理】
+│   │     apply_clahe(LAB色彩空间对比度增强) / preprocess_for_inference(保持宽高比缩放+中心裁剪)
+│   ├── raw/ ← 原始数据缓存（organized目录为ImageFolder格式）
+│   └── processed/ ← 预处理数据预留目录
+│
+├── models/
+│   ├── transfer.py ← 【迁移学习模型】
+│   │     TransferLearningModel(支持8种骨干网络：resnet50/101/152, densenet121/169, efficientnet_b0/b1, convnext_tiny)
+│   │     build_model工厂函数
+│   └── cnn.py ← 【自定义CNN模型】
+│         ConvBlock / SEBlock(Squeeze-and-Excitation注意力) / InceptionBlock(多尺度特征提取)
+│         CustomCNN(初始层→Inception→SE注意力→降采样→Inception→SE注意力→GAP→两阶段分类头)
+│         kaiming_normal权重初始化
+│
+├── train.py ← 【训练引擎】
+│     EarlyStopping类(patience=15, deepcopy最佳状态)
+│     train_one_epoch(前向+反向+梯度裁剪10.0+Evaluator统计+ProgressBar)
+│     validate(@torch.no_grad评估模式)
+│     train_model主循环(epoch循环→训练→验证→测试→调度→记录→保存→早停→恢复最佳)
+│
+├── evaluate.py ← 【评估引擎】
+│     evaluate_model(5项可视化输出：混淆矩阵×2 + 样本预测 + ROC曲线 + 类别指标柱状图)
+│     load_checkpoint(模型权重恢复)
+│
+├── inference.py ← 【推理引擎】
+│     load_model_for_inference / preprocess_single_image(CLAHE+标准化)
+│     predict_image(Softmax+topk) / predict_single(单图) / predict_batch(批量，限100张)
+│     print_prediction_result(Unicode方块柱状图显示概率分布)
+│
+├── utils/
+│   ├── metrics.py ← 【评估指标计算】
+│   │     AverageMeter(滑动平均) / Evaluator(11项指标一站式计算，sklearn后端) / ConfusionMatrix(增量混淆矩阵+灵敏度/特异度推导)
+│   ├── logger.py ← 【日志记录】
+│   │     Logger(Python logging双通道 + TensorBoard SummaryWriter + JSON历史保存)
+│   │     ProgressBar(30字符ASCII进度条，实时显示损失/准确率/耗时)
+│   └── visualization.py ← 【可视化工具】
+│         Visualizer类(matplotlib Agg后端，7种可视化：训练曲线/混淆矩阵/类别指标柱状图/样本预测网格/Grad-CAM热力图/t-SNE特征分布/ROC曲线)
+│         中文字体支持(SimHei/Microsoft YaHei)，DPI=150高分辨率输出
+│
+├── checkpoints/ ← 模型权重存储（best_model_xxx.pth）
+├── results/ ← 评估结果图表输出（6张PNG）
+├── logs/ ← 训练日志（.log文本 + _history.json + tensorboard/事件文件）
+└── requirements.txt ← 依赖清单（torch, torchvision, numpy, matplotlib, scikit-learn, Pillow, tqdm, tensorboard, opencv-python, kagglehub）
+
+==================== 要求 ====================
+
+1. 请将"视角一"画成一张横向展开的流程图，五个阶段用不同颜色的矩形框区分，每个阶段内部嵌套子步骤的矩形，用箭头连接表示数据流向
+2. 请将"视角二"画成一张纵向展开的思维导图（树状结构），根节点是项目名，第一层分支是顶层文件/目录，逐层展开到具体函数和类
+3. 两张图都要标注关键的技术细节（如参数名、函数名、超参数值），不要只写空洞的概念
+4. 使用中文字体，风格统一，颜色协调
+5. 越详细越好，每个模块的关键函数名和参数都要体现出来
