@@ -26,6 +26,11 @@ build/
 # Jupyter
 .ipynb_checkpoints/
 
+# 文档（仅本地保留）
+一、程序功能.txt
+实验报告.md
+思维导图提示词.txt
+
 # 系统文件
 .DS_Store
 Thumbs.db
